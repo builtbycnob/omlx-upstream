@@ -16,9 +16,10 @@ import re
 import shutil
 import tempfile
 import time as _time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 import numpy as np
 
@@ -149,7 +150,7 @@ class OQImatrixData:
 
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
-) -> Union[bool, dict]:
+) -> bool | dict:
     """Per-tensor quantization decision based on GGUF/unsloth/llama.cpp rules.
 
     Protection levels vary by oQ level:
@@ -964,8 +965,7 @@ def _build_quant_plan(
             f"{name}×{count}" for name, count in sorted(route_dist.items())
         )
         logger.info(
-            f"  plan detail: {bits_summary} | routes: {route_summary} | "
-            f"top: {top_str}"
+            f"  plan detail: {bits_summary} | routes: {route_summary} | top: {top_str}"
         )
 
     return QuantPlan(
@@ -2142,7 +2142,7 @@ def _sensitivity_lm_config_override(config: dict) -> dict | None:
 def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     """Create a quant_predicate closure for mlx-lm's quantize_model."""
 
-    def predicate(path: str, module) -> Union[bool, dict]:
+    def predicate(path: str, module) -> bool | dict:
         return universal_quant_predicate(path, module, config, oq_level)
 
     return predicate
@@ -3924,7 +3924,7 @@ def quantize_oq_streaming(
     output_path: str,
     oq_level: int,
     group_size: int = 64,
-    progress_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Callable[[str, float], None] | None = None,
     text_only: bool = False,
     target_bpw: float | None = None,
     hard_cap_bpw: float | None = None,
@@ -4094,8 +4094,7 @@ def quantize_oq_streaming(
         if _ram_safe_proxy_dir is not None and _ram_safe_proxy_dir.exists():
             shutil.rmtree(_ram_safe_proxy_dir, ignore_errors=True)
             logger.info(
-                f"oQ{oq_level:g}: cleaned up calibration proxy at "
-                f"{_ram_safe_proxy_dir}"
+                f"oQ{oq_level:g}: cleaned up calibration proxy at {_ram_safe_proxy_dir}"
             )
         _ram_safe_proxy_dir = None
 
@@ -4140,9 +4139,7 @@ def quantize_oq_streaming(
                 progress_callback=cb,
                 progress_start=13.0,
                 progress_end=18.0,
-                load_path_factory=(
-                    _imatrix_load_path if _model_exceeds_ram else None
-                ),
+                load_path_factory=(_imatrix_load_path if _model_exceeds_ram else None),
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -5642,6 +5639,154 @@ def _collect_imatrix_from_model(
     return collector.entries, metadata
 
 
+# --- Streamed per-layer weight sourcing (layer-streaming imatrix collector) ---
+# MiniMax-M3 focused for now: the layer prefix, the args location, and the
+# lazy-load path in _streamed_text_args assume the minimax_m3_vl layout.
+# When a second architecture needs streaming, a model-type dispatch table
+# replaces the hardcoded prefix and the args lookup.
+
+_STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
+_STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
+
+
+def _streamed_text_args(model_path, *, trust_remote_code: bool = False):
+    """TextConfig plus the concrete decoder layer class for streamed sourcing.
+
+    Lazy-loads the VLM once through the same path _collect_imatrix uses (so
+    the M3 compat patches apply), reads language_model.model.args and the
+    layer class off the live model, then drops it. Lazy load never
+    materializes weights, so this costs seconds, not RAM.
+    """
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    maybe_apply_pre_load_patches(str(model_path), for_vlm=True)
+
+    from mlx_vlm.utils import load_model as vlm_load_model
+
+    orig_load_weights = nn.Module.load_weights
+
+    def _lenient_load_weights(self, file_or_weights, *args, **kwargs):
+        kwargs.pop("strict", None)
+        return orig_load_weights(self, file_or_weights, *args, strict=False, **kwargs)
+
+    nn.Module.load_weights = _lenient_load_weights
+    try:
+        model = vlm_load_model(
+            Path(model_path), lazy=True, trust_remote_code=trust_remote_code
+        )
+    finally:
+        nn.Module.load_weights = orig_load_weights
+
+    lm = model.language_model.model
+    args = lm.args
+    layer_cls = type(lm.layers[0])
+    del lm, model
+    mx.clear_cache()
+    return args, layer_cls
+
+
+def _streamed_source_plan(model_path, config: dict) -> "_DiscoveredPlan":
+    """Private lazy index plus discovered sanitize plan for one pass.
+
+    _DiscoveredPlan.pop is destructive, so every streaming pass builds its
+    own instance instead of sharing the quantize loop's. The rebuild is
+    header-only and costs seconds.
+    """
+    weight_files = sorted(Path(model_path).glob("*.safetensors"))
+    if not weight_files:
+        raise FileNotFoundError(f"no safetensors shards under {model_path}")
+    lazy_index = _LazyTensorIndex(weight_files)
+    sanitize_fn = _build_model_sanitizer(config)
+    if sanitize_fn is None:
+        raise RuntimeError(f"no sanitizer for model_type={config.get('model_type')!r}")
+    plan = _discover_sanitize_plan(sanitize_fn, lazy_index)
+    if plan is None:
+        raise RuntimeError("sanitize plan discovery failed for streamed sourcing")
+    return _DiscoveredPlan(plan, lazy_index)
+
+
+def _streamed_layer_items(dp: "_DiscoveredPlan", layer_idx: int) -> list:
+    """Pop every tensor of one text layer, keyed relative to the bare block."""
+    prefix = f"{_STREAM_TEXT_LAYER_PREFIX}{layer_idx}."
+    keys = sorted(k for k in dp if k.startswith(prefix))
+    if not keys:
+        raise KeyError(f"no checkpoint tensors for text layer {layer_idx}")
+    return [(k[len(prefix) :], dp.pop(k)) for k in keys]
+
+
+def _load_streamed_block_weights(block, items, layer_idx: int) -> str:
+    """Fill a bare decoder block from popped checkpoint tensors.
+
+    strict=True is the primary path. If mlx rejects the pairing (raw-array
+    attributes like e_score_correction_bias could plausibly trip it), fall
+    back to a lenient load guarded by an exact key-set and shape check so
+    nothing goes missing silently. Returns "strict" or "lenient".
+    """
+    try:
+        block.load_weights(items, strict=True)
+        return "strict"
+    except ValueError as exc:
+        expected = dict(tree_flatten(block.parameters()))
+        got = dict(items)
+        missing = sorted(set(expected) - set(got))
+        extra = sorted(set(got) - set(expected))
+        if missing or extra:
+            raise ValueError(
+                f"streamed layer {layer_idx}: checkpoint keys do not cover "
+                f"the block (missing={missing}, extra={extra})"
+            ) from exc
+        bad_shapes = sorted(
+            k for k, v in got.items() if tuple(v.shape) != tuple(expected[k].shape)
+        )
+        if bad_shapes:
+            raise
+        logger.info(
+            "streamed layer %d: strict load rejected a matching key set (%s); "
+            "using lenient load with key-set and shape guards",
+            layer_idx,
+            exc,
+        )
+        block.load_weights(items, strict=False)
+        return "lenient"
+
+
+def _iter_streamed_layer_blocks(
+    source, config: dict, *, trust_remote_code: bool = False
+):
+    """Yield (layer_idx, block, is_moe) with each text layer fully resident.
+
+    Each layer gets its own bare decoder block (attention wiring is
+    layer-index dependent, so one instance cannot be reused across the
+    dense/MoE boundary), filled straight from the checkpoint through a
+    private sanitize plan and evaluated before the yield. The caller owns
+    the block; the generator drops its own reference before popping the
+    next layer so at most one layer's weights are ever resident here.
+    """
+    args, layer_cls = _streamed_text_args(source, trust_remote_code=trust_remote_code)
+    dp = _streamed_source_plan(source, config)
+    for layer_idx in range(args.num_hidden_layers):
+        items = _streamed_layer_items(dp, layer_idx)
+        block = layer_cls(args, layer_idx)
+        mode = _load_streamed_block_weights(block, items, layer_idx)
+        del items
+        mx.eval(block.parameters())
+        is_moe = bool(block.is_moe_layer)
+        logger.debug(
+            "streamed layer %d sourced (%s load, moe=%s)", layer_idx, mode, is_moe
+        )
+        yield layer_idx, block, is_moe
+        del block  # delete-L before load-L+1: never two layers resident here
+        mx.clear_cache()
+
+
+def _streamed_embed_weight(source, config: dict):
+    """Source the token embedding table (bf16 on disk) for the stage-0 pass."""
+    dp = _streamed_source_plan(source, config)
+    weight = dp.pop(_STREAM_EMBED_KEY)
+    mx.eval(weight)
+    return weight
+
+
 def _collect_imatrix(
     model_path: str,
     config: dict,
@@ -5758,9 +5903,7 @@ def _oqe_cache_missing_mtp_entries(cache: OQImatrixData, config: dict) -> bool:
             return False
     except Exception:
         return False
-    return not any(
-        ".mtp." in key or key.startswith("mtp.") for key in cache.entries
-    )
+    return not any(".mtp." in key or key.startswith("mtp.") for key in cache.entries)
 
 
 def _load_or_collect_imatrix(
@@ -5809,8 +5952,7 @@ def _load_or_collect_imatrix(
                 )
                 return cache
             logger.info(
-                "oQe imatrix: cache missing required expert coverage, "
-                "recollecting %s",
+                "oQe imatrix: cache missing required expert coverage, recollecting %s",
                 path,
             )
         else:
@@ -6337,8 +6479,10 @@ def _measure_sensitivity_from_quantized_model(
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
-        lm_load_compat as lm_load,
         maybe_apply_pre_load_patches,
+    )
+    from omlx.utils.model_loading import (
+        lm_load_compat as lm_load,
     )
 
     # Reuse the centralised pre-load dispatch (DeepSeek V4 base patch,
@@ -6364,13 +6508,10 @@ def _measure_sensitivity_from_quantized_model(
                     apply_mlx_vlm_mtp_runtime_patch()
                     prev_active = is_mtp_active()
                     set_mtp_active(True)
-                    restore_mtp_active = lambda: set_mtp_active(
-                        prev_active
-                    )  # noqa: E731
+                    restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
                 except Exception as e:
                     logger.debug(
-                        "mlx-vlm MTP runtime patch skipped for proxy sensitivity: "
-                        f"{e}"
+                        f"mlx-vlm MTP runtime patch skipped for proxy sensitivity: {e}"
                     )
 
             from mlx_lm.tokenizer_utils import load as load_tokenizer
