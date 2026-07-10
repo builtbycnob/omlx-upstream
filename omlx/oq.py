@@ -6195,6 +6195,7 @@ def _collect_imatrix_streaming(
         # resident collector's head pass is a no-op for them too. A source
         # with real mtp.* tensors needs the _collect_mtp_head_imatrix
         # equivalent added after the last layer.
+        first_streamed_layer = round_index == 0
         for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
             source, config, trust_remote_code=trust_remote_code
         ):
@@ -6202,6 +6203,21 @@ def _collect_imatrix_streaming(
             layer_installed = collector.install(block, name_prefix=prefix)
             if round_index == 0:
                 installed += layer_installed
+            if first_streamed_layer:
+                # Fail on the first layer, not after a full sweep: if the
+                # capture predicate matches nothing on a real decoder block
+                # the source layout is wrong and every layer would install
+                # zero, so the imatrix would come back empty after streaming
+                # the whole model for nothing.
+                first_streamed_layer = False
+                if layer_installed == 0:
+                    collector.restore(block)
+                    raise RuntimeError(
+                        f"streamed layer {layer_idx}: collector installed 0 "
+                        f"capture modules on {type(block).__name__}; the source "
+                        "layout does not match the capture predicate. Refusing "
+                        f"to sweep all {total_layers} layers for an empty imatrix"
+                    )
             try:
                 for slot in range(len(working)):
                     out, _ = _forward_layer_result(

@@ -486,3 +486,26 @@ def test_cache_load_kind_busts_legacy(
         str(fixture_dir), fixture_config, **common, stream_calibration=False
     )
     assert fifth.reused is True
+
+
+def test_streaming_aborts_on_first_layer_zero_install(
+    fixture_dir, fixture_config, tokenizer, monkeypatch
+):
+    """A source whose layout defeats the capture predicate must abort on the
+    first layer, not after streaming every layer for an empty imatrix."""
+    monkeypatch.setattr(oq.OQImatrixCollector, "install", lambda self, *a, **k: 0)
+    with (
+        _pinned_micro_batch(MICRO_BATCH),
+        pytest.raises(RuntimeError, match="installed 0 capture modules"),
+    ):
+        _collect_imatrix_streaming(
+            fixture_dir,
+            tokenizer,
+            fixture_config,
+            calib_dataset=_OQE_CALIB_DATASET,
+            num_samples=NUM_SAMPLES,
+            seq_length=SEQ_LENGTH,
+            calib_seed=CALIB_SEED,
+        )
+    mx.synchronize()
+    mx.clear_cache()
