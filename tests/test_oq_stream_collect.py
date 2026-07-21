@@ -287,19 +287,45 @@ def streaming_result(fixture_dir, fixture_config, tokenizer):
 
 
 def test_stream_calibration_flag_resolution(monkeypatch):
-    """Explicit argument beats the env var, env var beats the RAM auto-rule."""
+    """Explicit argument beats the env var, env var beats the RAM auto-rule.
+
+    Runs on a supported model_type so the precedence, not the layout gate, is
+    what these assertions exercise. The gate itself lives in
+    test_oq_stream_resolve.py.
+    """
     monkeypatch.delenv("OMLX_OQ_STREAM_CALIBRATION", raising=False)
-    assert _resolve_stream_calibration(True, model_exceeds_ram=False) is True
-    assert _resolve_stream_calibration(False, model_exceeds_ram=True) is False
-    assert _resolve_stream_calibration(None, model_exceeds_ram=True) is True
-    assert _resolve_stream_calibration(None, model_exceeds_ram=False) is False
+    mt = "minimax_m3_vl"
+    assert (
+        _resolve_stream_calibration(True, model_exceeds_ram=False, model_type=mt)
+        is True
+    )
+    assert (
+        _resolve_stream_calibration(False, model_exceeds_ram=True, model_type=mt)
+        is False
+    )
+    assert (
+        _resolve_stream_calibration(None, model_exceeds_ram=True, model_type=mt) is True
+    )
+    assert (
+        _resolve_stream_calibration(None, model_exceeds_ram=False, model_type=mt)
+        is False
+    )
 
     monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", "1")
-    assert _resolve_stream_calibration(None, model_exceeds_ram=False) is True
+    assert (
+        _resolve_stream_calibration(None, model_exceeds_ram=False, model_type=mt)
+        is True
+    )
     monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", "off")
-    assert _resolve_stream_calibration(None, model_exceeds_ram=True) is False
+    assert (
+        _resolve_stream_calibration(None, model_exceeds_ram=True, model_type=mt)
+        is False
+    )
     monkeypatch.setenv("OMLX_OQ_STREAM_CALIBRATION", "0")
-    assert _resolve_stream_calibration(True, model_exceeds_ram=False) is True
+    assert (
+        _resolve_stream_calibration(True, model_exceeds_ram=False, model_type=mt)
+        is True
+    )
 
 
 def test_streaming_matches_resident_imatrix(resident_result, streaming_result):

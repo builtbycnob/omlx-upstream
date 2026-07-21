@@ -3937,7 +3937,10 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
 
 
 def _resolve_stream_calibration(
-    stream_calibration: bool | None, *, model_exceeds_ram: bool
+    stream_calibration: bool | None,
+    *,
+    model_exceeds_ram: bool,
+    model_type: str | None,
 ) -> bool:
     """Decide whether oQe calibration streams layers from the checkpoint.
 
@@ -3945,15 +3948,38 @@ def _resolve_stream_calibration(
     then the auto rule: stream when the source does not fit in RAM, where
     the resident collector would otherwise calibrate on a lossy quantized
     proxy of the model.
+
+    Streaming only works for the layouts the sourcer understands
+    (_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES). For every other model_type
+    the auto rule and a truthy env var stay on the proxy path, and an
+    explicit stream_calibration=True fails fast here with a clear message
+    rather than an AttributeError deep in the sourcer.
     """
+    supported = _stream_calibration_supported(model_type)
     if stream_calibration is not None:
+        if stream_calibration and not supported:
+            raise ValueError(
+                f"stream_calibration=True was requested for "
+                f"model_type={model_type!r}, but the streaming imatrix sourcer "
+                f"only supports {sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES)}. "
+                "Leave stream_calibration unset to calibrate through the RAM-safe "
+                "proxy, or extend the streamed sourcer for this layout."
+            )
         return bool(stream_calibration)
     env = os.environ.get("OMLX_OQ_STREAM_CALIBRATION", "").strip().lower()
     if env in ("1", "true", "yes", "on"):
-        return True
+        if not supported:
+            logger.warning(
+                "OMLX_OQ_STREAM_CALIBRATION asked for streaming calibration, but "
+                "model_type=%r has no streamed sourcer (supported: %s); using the "
+                "RAM-safe proxy instead.",
+                model_type,
+                sorted(_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES),
+            )
+        return supported
     if env in ("0", "false", "no", "off"):
         return False
-    return model_exceeds_ram
+    return model_exceeds_ram and supported
 
 
 def quantize_oq_streaming(
@@ -4029,8 +4055,12 @@ def quantize_oq_streaming(
             oq_sensitivity_map.json or an explicit sensitivity_model_path
             still wins over both. None (default) auto-enables streaming when
             the source exceeds the RAM budget; the OMLX_OQ_STREAM_CALIBRATION
-            environment variable overrides the auto rule. Only consulted when
-            enhanced is True.
+            environment variable overrides the auto rule. The streamed sourcer
+            only supports the MiniMax-M3 (minimax_m3_vl) layout, so both the
+            auto rule and a truthy env var stay on the RAM-safe proxy for every
+            other model_type, and an explicit stream_calibration=True on an
+            unsupported layout raises a ValueError up front instead of failing
+            deep in the sourcer. Only consulted when enhanced is True.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -4171,7 +4201,9 @@ def quantize_oq_streaming(
         cb("imatrix", 13.0, "Preparing oQe imatrix calibration")
 
         stream_imatrix = _resolve_stream_calibration(
-            stream_calibration, model_exceeds_ram=_model_exceeds_ram
+            stream_calibration,
+            model_exceeds_ram=_model_exceeds_ram,
+            model_type=str(config.get("model_type", "")),
         )
         if stream_imatrix:
             logger.info(
@@ -5762,10 +5794,23 @@ def _collect_imatrix_from_model(
 # MiniMax-M3 focused for now: the layer prefix, the args location, and the
 # lazy-load path in _streamed_text_args assume the minimax_m3_vl layout.
 # When a second architecture needs streaming, a model-type dispatch table
-# replaces the hardcoded prefix and the args lookup.
+# replaces the hardcoded prefix and the args lookup, and its model_type joins
+# _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES below so the calibration decision
+# starts routing it through the streamed path.
 
 _STREAM_TEXT_LAYER_PREFIX = "language_model.model.layers."
 _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
+
+# Only these checkpoint model_types have a streamed sourcer. Every other layout
+# keeps the RAM-safe proxy calibration path: the auto rule never streams them,
+# and an explicit stream_calibration request for one fails fast (see
+# _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
+_STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset({"minimax_m3_vl"})
+
+
+def _stream_calibration_supported(model_type: str | None) -> bool:
+    """True when the streamed sourcer handles this checkpoint's layout."""
+    return str(model_type or "").lower() in _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES
 
 
 def _streamed_text_args(model_path, *, trust_remote_code: bool = False):
