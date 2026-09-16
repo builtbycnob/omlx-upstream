@@ -439,14 +439,13 @@ class TestNativePathWiring:
         assert bg._is_mtp_eligible(batch) is True
         assert bg._ineligibility_reason(batch) == ""
 
-    def test_grammar_rows_stay_off_rowwise_batch_mtp(self, compiled, monkeypatch):
+    def test_grammar_rows_stay_off_multi_request_mtp(self, compiled):
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
-        monkeypatch.setenv(bg._ROWWISE_BATCH_MTP_ENV, "1")
+        model = _MtpModel()
+        model._omlx_mtp_multi_request = True
         proc = GrammarConstraintProcessor(compiled, VOCAB_SIZE)
-        batch = SimpleNamespace(
-            model=_MtpModel(), uids=[1, 2], logits_processors=[[proc], []]
-        )
+        batch = SimpleNamespace(model=model, uids=[1, 2], logits_processors=[[proc], []])
         assert bg._is_mtp_batch_eligible(batch) is False
         assert "grammar" in bg._ineligibility_reason(batch)
         batch.logits_processors = [[], []]
@@ -571,6 +570,12 @@ class TestNativePathWiring:
             fallback_sampler=_argmax_sampler,
             logits_processors=[[proc]],
             _token_context=[buffer],
+            max_tokens=[1000],
+            _num_tokens=[0],
+            _matcher_states=[0],
+            state_machines=[
+                SimpleNamespace(match=lambda state, token: (0, None, None))
+            ],
         )
 
         bg._run_verify_cycle_chain(batch, state)
